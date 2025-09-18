@@ -1,0 +1,414 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+import rasterio
+from rasterio.windows import Window
+import matplotlib.pyplot as plt
+import geopandas as gpd
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from skimage.feature import graycomatrix, graycoprops
+from skimage.feature import local_binary_pattern
+from scipy.ndimage import convolve
+import os
+import logging
+from datetime import datetime
+
+# Define CBAM (Convolutional Block Attention Module) - same as training script
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
+# Define Spatial Dropout - same as training script
+class SpatialDropout(nn.Module):
+    def __init__(self, drop_prob):
+        super(SpatialDropout, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0:
+            return x
+        batch, channels, height, width = x.size()
+        mask = torch.rand(batch, channels, 1, 1, device=x.device) > self.drop_prob
+        mask = mask.expand_as(x)
+        return x * mask / (1 - self.drop_prob)
+
+# Configuration - match training script
+config = {
+    "patch_size": 32,  # Window size, so patch is 64x64
+    "batch_size": 32,  # Larger batch size for prediction to speed up
+    "num_classes": 5,
+    "num_channels": 21,  # Same as training: 4 bands + 6 indices + 4 GLCM + 3 texture/contextual + 4 DEM-derived
+    "class1_threshold": 0.25,
+    "class3_threshold": 0.2,
+    "log_dir": r"C:\Users\janeg\Desktop\2024Pridictions\logs",
+    "output_path": r"C:\Users\janeg\Desktop\2024Pridictions\predictions\land_use_map_2024_v26.tif",
+}
+
+# Setup logging
+os.makedirs(config["log_dir"], exist_ok=True)
+os.makedirs(os.path.dirname(config["output_path"]), exist_ok=True)
+log_file = os.path.join(config["log_dir"], f"prediction_log_2024_v26_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', handlers=[
+    logging.FileHandler(log_file),
+    logging.StreamHandler()
+])
+logging.info(f"Prediction started with config: {config}")
+
+# Paths
+image_path = r"C:\Users\janeg\Desktop\2024Pridictions\Landsat8_2024_Malawi_Merged.tif"
+dem_path = r"C:\Users\janeg\Desktop\2024Pridictions\Merge raster\Raster.tif"
+model_path = r"C:\Users\janeg\Desktop\2024Pridictions\logs\best_land_use_classifier_v26.pth"
+
+# Device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logging.info(f"Running on {'GPU' if torch.cuda.is_available() else 'CPU'}")
+
+# Step 1: Load the Model
+model = models.resnet18()
+for name, param in model.named_parameters():
+    if "layer3" not in name and "layer4" not in name and "fc" not in name:
+        param.requires_grad = False
+model.conv1 = nn.Conv2d(config["num_channels"], 64, kernel_size=3, stride=1, padding=1, bias=False)
+model.maxpool = nn.Identity()
+model_spatial_dropout = nn.Sequential(
+    model.conv1,
+    model.bn1,
+    model.relu,
+    SpatialDropout(drop_prob=0.2)
+)
+model.conv1 = model_spatial_dropout
+model = nn.Sequential(
+    *list(model.children())[:-2],  # Up to layer4
+    CBAM(in_planes=512),
+    nn.AdaptiveAvgPool2d((1, 1)),
+    nn.Flatten(),
+    nn.Dropout(0.7),  # Match training dropout
+    nn.BatchNorm1d(512),
+    nn.Linear(512, config["num_classes"])
+)
+model.load_state_dict(torch.load(model_path))
+model = model.to(device)
+model.eval()
+logging.info(f"Model loaded from {model_path}")
+
+# Step 2: Define Prediction Dataset
+class PredictionDataset(Dataset):
+    def __init__(self, image_path, dem_path, window_size=32, stride=32):
+        self.image_path = image_path
+        self.dem_path = dem_path
+        self.window_size = window_size
+        self.stride = stride
+
+        # Load metadata
+        with rasterio.open(self.image_path) as src:
+            self.image_meta = src.meta.copy()
+            self.width = src.width
+            self.height = src.height
+            self.transform = src.transform
+            self.crs = src.crs
+            self.num_bands = src.count
+        logging.info(f"Image dimensions: {self.width}x{self.height}, Bands: {self.num_bands}")
+
+        with rasterio.open(self.dem_path) as src:
+            self.dem_meta = src.meta.copy()
+            self.dem_width = src.width
+            self.dem_height = src.height
+            self.dem_transform = src.transform
+            self.dem_crs = src.crs
+            self.resolution = src.res[0]
+        logging.info(f"DEM dimensions: {self.dem_width}x{self.dem_height}, Resolution: {self.resolution}m")
+
+        # Compute positions for patches
+        self.positions = []
+        for row in range(0, self.height, self.stride):
+            for col in range(0, self.width, self.stride):
+                self.positions.append((row, col))
+        logging.info(f"Total patches to process: {len(self.positions)}")
+
+        # Initialize scalers (we'll fit them on a subset of patches)
+        self.scalers = [StandardScaler() for _ in range(config["num_channels"])]
+
+    def fit_scalers(self):
+        # Sample a subset of patches to fit scalers
+        sample_size = min(1000, len(self.positions))
+        sample_indices = np.random.choice(len(self.positions), sample_size, replace=False)
+        sample_patches = []
+        for idx in sample_indices:
+            patch = self._get_patch(idx)
+            if patch is not None:
+                sample_patches.append(patch)
+        sample_patches = np.array(sample_patches)
+        for channel in range(sample_patches.shape[1]):
+            channel_data = sample_patches[:, channel, :, :].reshape(-1, 1)
+            self.scalers[channel].fit(channel_data)
+        logging.info("Scalers fitted on sample patches")
+
+    def normalize(self, image):
+        for channel in range(image.shape[0]):
+            channel_data = image[channel, :, :].reshape(-1, 1)
+            image[channel, :, :] = self.scalers[channel].transform(channel_data).reshape(image.shape[1], image.shape[2])
+        return image
+
+    def _get_patch(self, idx):
+        row, col = self.positions[idx]
+        window = Window(col - self.window_size, row - self.window_size, self.window_size * 2, self.window_size * 2)
+
+        # Read Landsat-8 patch
+        try:
+            with rasterio.open(self.image_path) as src:
+                image = src.read(window=window)
+                if image.shape[0] > 4:
+                    image = image[:4, :, :]
+        except Exception as e:
+            logging.warning(f"Failed to read image patch at position ({row}, {col}): {str(e)}")
+            return None
+
+        if image.shape[1] != self.window_size * 2 or image.shape[2] != self.window_size * 2:
+            padded_image = np.zeros((4, self.window_size * 2, self.window_size * 2), dtype=image.dtype)
+            h, w = image.shape[1], image.shape[2]
+            padded_image[:, :h, :w] = image
+            image = padded_image
+
+        # Read DEM patch
+        # Adjust for DEM's coordinate system (assuming alignment with image for simplicity)
+        dem_window = Window(col - self.window_size, row - self.window_size, self.window_size * 2, self.window_size * 2)
+        try:
+            with rasterio.open(self.dem_path) as src:
+                dem = src.read(1, window=dem_window)
+        except Exception as e:
+            logging.warning(f"Failed to read DEM patch at position ({row}, {col}): {str(e)}")
+            return None
+
+        if dem.shape != (self.window_size * 2, self.window_size * 2):
+            padded_dem = np.zeros((self.window_size * 2, self.window_size * 2), dtype=dem.dtype)
+            h, w = dem.shape[0], dem.shape[1]
+            padded_dem[:h, :w] = dem
+            dem = padded_dem
+
+        # Compute features (same as training)
+        blue = image[0].astype(np.float32)
+        green = image[1].astype(np.float32)
+        red = image[2].astype(np.float32)
+        nir = image[3].astype(np.float32)
+
+        ndvi = (nir - red) / (nir + red + 1e-8)
+        ndvi = np.clip(ndvi, -1, 1)
+
+        ndwi = (green - nir) / (green + nir + 1e-8)
+        ndwi = np.clip(ndwi, -1, 1)
+
+        evi = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1 + 1e-8)
+        evi = np.clip(evi, -1.5, 1.5)
+
+        L = 0.5
+        savi = ((nir - red) * (1 + L)) / (nir + red + L + 1e-8)
+        savi = np.clip(savi, -1, 1)
+
+        msavi = (2 * nir + 1 - np.sqrt((2 * nir + 1)**2 - 8 * (nir - red))) / (2 + 1e-8)
+        msavi = np.clip(msavi, -1, 1)
+
+        ndbi = (nir - red) / (nir + red + 1e-8)
+        ndbi = np.clip(ndbi, -1, 1)
+
+        # GLCM features
+        nir_uint8 = (nir - nir.min()) / (nir.max() - nir.min() + 1e-8) * 255
+        nir_uint8 = nir_uint8.astype(np.uint8)
+        glcm = graycomatrix(nir_uint8, distances=[1], angles=[0, 45, 90, 135], levels=256, symmetric=True, normed=True)
+        contrast = np.mean([graycoprops(glcm, 'contrast')[0, i] for i in range(4)])
+        correlation = np.mean([graycoprops(glcm, 'correlation')[0, i] for i in range(4)])
+        homogeneity = np.mean([graycoprops(glcm, 'homogeneity')[0, i] for i in range(4)])
+        energy = np.mean([graycoprops(glcm, 'energy')[0, i] for i in range(4)])
+        contrast_map = np.full((self.window_size * 2, self.window_size * 2), contrast, dtype=np.float32)
+        correlation_map = np.full((self.window_size * 2, self.window_size * 2), correlation, dtype=np.float32)
+        homogeneity_map = np.full((self.window_size * 2, self.window_size * 2), homogeneity, dtype=np.float32)
+        energy_map = np.full((self.window_size * 2, self.window_size * 2), energy, dtype=np.float32)
+
+        # NIR variance
+        nir_variance = np.var(nir)
+        variance_map = np.full((self.window_size * 2, self.window_size * 2), nir_variance, dtype=np.float32)
+
+        # LBP
+        lbp = local_binary_pattern(nir_uint8, P=8, R=1, method='uniform')
+        lbp = lbp.astype(np.float32)
+        lbp = (lbp - lbp.min()) / (lbp.max() - lbp.min() + 1e-8)
+
+        # Proximity-to-water
+        water_mask = (ndwi > 0.4) & (nir < 0.1)  # Match tightened threshold from training
+        proximity_to_water = np.where(water_mask, 1.0, 0.0).astype(np.float32)
+
+        # DEM-derived features
+        dem = dem.astype(np.float32)
+        dy, dx = np.gradient(dem, self.resolution)
+        slope = np.arctan(np.sqrt(dx**2 + dy**2)) * (180 / np.pi)
+        slope = slope.astype(np.float32)
+
+        aspect = np.arctan2(dy, dx) * (180 / np.pi)
+        aspect = np.where(aspect < 0, aspect + 360, aspect)
+        aspect = aspect.astype(np.float32)
+
+        kernel = np.array([[1, 1, 1], [1, -8, 1], [1, 1, 1]])
+        try:
+            tri = np.abs(convolve(dem, kernel, mode='constant', cval=0.0))
+            tri = tri.astype(np.float32)
+        except Exception as e:
+            logging.warning(f"TRI computation failed at position ({row}, {col}): {str(e)}")
+            tri = np.zeros_like(dem)
+
+        # Stack features (21 channels)
+        image = np.concatenate([
+            image,
+            ndvi[np.newaxis, :, :],
+            ndwi[np.newaxis, :, :],
+            evi[np.newaxis, :, :],
+            savi[np.newaxis, :, :],
+            msavi[np.newaxis, :, :],
+            ndbi[np.newaxis, :, :],
+            contrast_map[np.newaxis, :, :],
+            correlation_map[np.newaxis, :, :],
+            homogeneity_map[np.newaxis, :, :],
+            energy_map[np.newaxis, :, :],
+            variance_map[np.newaxis, :, :],
+            lbp[np.newaxis, :, :],
+            proximity_to_water[np.newaxis, :, :],
+            dem[np.newaxis, :, :],
+            slope[np.newaxis, :, :],
+            aspect[np.newaxis, :, :],
+            tri[np.newaxis, :, :]
+        ], axis=0)
+
+        if np.any(np.isnan(image)) or np.any(np.isinf(image)):
+            logging.warning(f"Invalid patch data at position ({row}, {col}): NaN or Inf detected")
+            return None
+
+        return image
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getitem__(self, idx):
+        patch = self._get_patch(idx)
+        if patch is None:
+            return torch.zeros((config["num_channels"], self.window_size * 2, self.window_size * 2), dtype=torch.float32), idx
+        patch = self.normalize(patch)
+        return torch.tensor(patch, dtype=torch.float32), idx
+
+# Step 3: Create Dataset and Fit Scalers
+dataset = PredictionDataset(image_path, dem_path, window_size=config["patch_size"], stride=config["patch_size"])
+dataset.fit_scalers()
+
+# Step 4: Predict Land Use
+dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)
+
+# Initialize output raster
+output_raster = np.zeros((dataset.height, dataset.width), dtype=np.uint8)
+count_raster = np.zeros((dataset.height, dataset.width), dtype=np.float32)  # For averaging overlapping predictions
+
+with torch.no_grad():
+    for batch, indices in dataloader:
+        batch = batch.to(device)
+        outputs = model(batch)
+        probs = torch.softmax(outputs, dim=1)
+        # Apply threshold adjustments
+        class1_mask = (probs[:, 1] >= config["class1_threshold"]).float()
+        class3_mask = (probs[:, 3] >= config["class3_threshold"]).float()
+        probs_adjusted = probs.clone()
+        probs_adjusted[:, 1] = probs[:, 1] * class1_mask
+        probs_adjusted[:, 3] = probs[:, 3] * class3_mask
+        _, preds = torch.max(probs_adjusted, 1)
+        preds = preds.cpu().numpy()
+
+        # Assign predictions to the output raster
+        for i, idx in enumerate(indices):
+            row, col = dataset.positions[idx]
+            # Define the window in the output raster
+            row_start = row
+            row_end = min(row + 2 * config["patch_size"], dataset.height)
+            col_start = col
+            col_end = min(col + 2 * config["patch_size"], dataset.width)
+            patch_size_h = row_end - row_start
+            patch_size_w = col_end - col_start
+
+            # Add predictions to the output raster
+            output_patch = output_raster[row_start:row_end, col_start:col_end]
+            count_patch = count_raster[row_start:row_end, col_start:col_end]
+            pred_patch = np.full((patch_size_h, patch_size_w), preds[i], dtype=np.uint8)
+
+            # Update output and count
+            output_patch += pred_patch
+            count_patch += 1
+
+        logging.info(f"Processed batch of {len(indices)} patches")
+
+# Average overlapping predictions
+output_raster = np.where(count_raster > 0, (output_raster / count_raster).astype(np.uint8), 0)
+logging.info("Prediction completed")
+
+# Step 5: Save the Output Raster
+output_meta = dataset.image_meta.copy()
+output_meta.update({
+    'dtype': 'uint8',
+    'count': 1,
+    'nodata': 255  # Use 255 as nodata value
+})
+with rasterio.open(config["output_path"], 'w', **output_meta) as dst:
+    dst.write(output_raster, 1)
+logging.info(f"Land use map saved to {(config['output_path'])}")
+
+# Step 6: Visualize the Result
+class_names = ['Forest', 'Urban', 'Bare Land', 'Agricultural', 'Water']
+class_colors = {
+    0: 'green',
+    1: 'red',
+    2: 'gray',
+    3: 'yellow',
+    4: 'blue'
+}
+plt.figure(figsize=(12, 10))
+for class_id, color in class_colors.items():
+    mask = output_raster == class_id
+    plt.imshow(mask, cmap=color, alpha=0.5 if mask.any() else 0, label=class_names[class_id])
+plt.legend()
+plt.title("Predicted Land Use Map for Malawi 2024")
+plt.axis('off')
+plt.savefig(os.path.join(config["log_dir"], "land_use_map_2024_v26.png"))
+plt.close()
+logging.info("Land use map visualization saved")
