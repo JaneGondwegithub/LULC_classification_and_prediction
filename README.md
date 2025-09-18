@@ -13,7 +13,7 @@ This repository contains a Python script for land use classification using Lands
 
 ###Setup###
 1.	Clone the Repository:
-2.	git clone https://github.com/username/land-use-classifier.git
+2.	git clone https://github.com/JaneGondwegithub/LULC_classification_and_prediction.git 
 3.	cd land-use-classifier
 4.	Install Dependencies:
 5.	pip install -r requirements.txt
@@ -51,7 +51,7 @@ o	Validation points with predictions saved to logs/validation_points_v24_final.c
 •	Customization: Modify the config dictionary in src/land_use_classifier.py to adjust hyperparameters (e.g., epochs, batch_size, patch_size).
 
 ###Computer Code Availability###
-The source code, quick-test script, and sample data are available at (https://github.com/JaneGondwegithub/LULC_classification_and_prediction). The repository is public and allows anonymous access.
+The source code, quick-test script, and sample data are available at https://github.com/JaneGondwegithub/LULC_classification_and_prediction.git. The repository is public and allows anonymous access.
 
 ###License###
 Copyright (c) 2025 Jane Ferah Gondwe.
